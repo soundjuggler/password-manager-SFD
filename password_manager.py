@@ -1,77 +1,76 @@
-"""
-Basic command-line password manager (college learning project).
+# BASIC COMMAND-LINE PASSWORD MANAGER (COLLEGE LEARNING PROJECT).
+#
+# STAGE 1: MASTER-PASSWORD AUTHENTICATION (HASH + VERIFY).
+# STAGE 2: SEPARATE ENCRYPTION KEY + ENCRYPTED VAULT (data.enc).
+#
+# SECURITY IDEA (WHY):
+#   AUTH: THE MASTER PASSWORD IS HASHED (PBKDF2) AND VERIFIED — NEVER STORED.
+#   ENCRYPTION: A DIFFERENT SALT DERIVES A Fernet KEY THAT EXISTS ONLY IN
+#   MEMORY WHILE LOGGED IN. SITE PASSWORDS ARE ENCRYPTED (MUST BE READABLE
+#   AGAIN), NOT HASHED. THE KEY IS NEVER WRITTEN TO DISK.
 
-Stage 1: Master-password authentication only.
-  - Register: create auth_salt + auth_hash (+ kdf_salt for later stages)
-  - Login: verify master password with hmac.compare_digest
-
-Security idea (WHY):
-  We never store the master password itself. We store a slow hash of it
-  (PBKDF2-HMAC-SHA256). On login we re-hash the attempt and compare.
-  That way a stolen config.json does not reveal the password in plain text.
-"""
-
+import base64
 import getpass
 import hashlib
 import hmac
 import json
 import os
 
+from cryptography.fernet import Fernet
+
 # ---------------------------------------------------------------------------
-# Constants
+# CONSTANTS
 # ---------------------------------------------------------------------------
 
-# Toggle later (Stage 4) for step-by-step demo output. Never print secrets.
+# TOGGLE LATER (STAGE 4) FOR STEP-BY-STEP DEMO OUTPUT. NEVER PRINT SECRETS.
 DEBUG = False
 
 CONFIG_FILE = "config.json"
+DATA_FILE = "data.enc"
 
-# WHY 600_000 iterations: PBKDF2 deliberately slows hashing so brute-force
-# guessing is expensive. Assignment requires this exact count.
+# WHY 600_000 ITERATIONS: PBKDF2 DELIBERATELY SLOWS HASHING SO BRUTE-FORCE
+# GUESSING IS EXPENSIVE. ASSIGNMENT REQUIRES THIS EXACT COUNT.
 PBKDF2_ITERATIONS = 600_000
 
-# WHY 16 bytes: 128 bits of randomness is standard for salts; os.urandom
-# draws from the OS CSPRNG so salts are unpredictable.
+# WHY 16 BYTES: 128 BITS OF RANDOMNESS IS STANDARD FOR SALTS; os.urandom
+# DRAWS FROM THE OS CSPRNG SO SALTS ARE UNPREDICTABLE.
 SALT_SIZE = 16
 
-# WHY SHA-256: strong, widely used hash; used inside PBKDF2 as required.
+# WHY SHA-256: STRONG, WIDELY USED HASH; USED INSIDE PBKDF2 AS REQUIRED.
 HASH_ALGORITHM = "sha256"
 
-# Maximum login tries before we stop (assignment: 3 attempts).
+# WHY 32 BYTES: Fernet NEEDS A 256-BIT KEY (THEN URL-SAFE BASE64-ENCODED).
+KEY_SIZE = 32
+
+# MAXIMUM LOGIN TRIES BEFORE WE STOP (ASSIGNMENT: 3 ATTEMPTS).
 MAX_LOGIN_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
-# Crypto helpers
+# CRYPTO HELPERS
 # ---------------------------------------------------------------------------
 
 def generate_salt():
-    """
-    Return 16 random bytes for use as a salt.
-
-    WHY: A unique salt per purpose (auth vs key derivation) means the same
-    master password produces different outputs for hashing and for encryption
-    keys. If one salt leaked or one use was broken, the other is not reused.
-    """
+    # RETURN 16 RANDOM BYTES FOR USE AS A SALT.
+    #
+    # WHY: A UNIQUE SALT PER PURPOSE (AUTH VS KEY DERIVATION) MEANS THE SAME
+    # MASTER PASSWORD PRODUCES DIFFERENT OUTPUTS FOR HASHING AND FOR ENCRYPTION
+    # KEYS. IF ONE SALT LEAKED OR ONE USE WAS BROKEN, THE OTHER IS NOT REUSED.
     return os.urandom(SALT_SIZE)
 
 
 def hash_password(password, salt):
-    """
-    Hash a password with PBKDF2-HMAC-SHA256 and the given salt.
-
-    Returns raw digest bytes (not hex). Callers decide how to store it.
-
-    WHY PBKDF2 (not plain SHA-256):
-      Plain SHA-256 is fast — attackers can try billions of guesses per second.
-      PBKDF2 repeats the HMAC many times so each guess is slow.
-
-    WHY we pass salt:
-      Without a salt, two users with the same password get the same hash
-      (and rainbow tables work). With a random salt, identical passwords
-      produce different hashes.
-    """
-    # password must be bytes for hashlib; encode as UTF-8.
+    # HASH A PASSWORD WITH PBKDF2-HMAC-SHA256 AND THE GIVEN SALT.
+    # RETURNS RAW DIGEST BYTES (NOT HEX). CALLERS DECIDE HOW TO STORE IT.
+    #
+    # WHY PBKDF2 (NOT PLAIN SHA-256):
+    #   PLAIN SHA-256 IS FAST — ATTACKERS CAN TRY BILLIONS OF GUESSES PER SECOND.
+    #   PBKDF2 REPEATS THE HMAC MANY TIMES SO EACH GUESS IS SLOW.
+    #
+    # WHY WE PASS salt:
+    #   WITHOUT A SALT, TWO USERS WITH THE SAME PASSWORD GET THE SAME HASH
+    #   (AND RAINBOW TABLES WORK). WITH A RANDOM SALT, IDENTICAL PASSWORDS
+    #   PRODUCE DIFFERENT HASHES.
     password_bytes = password.encode("utf-8")
     return hashlib.pbkdf2_hmac(
         HASH_ALGORITHM,
@@ -81,22 +80,42 @@ def hash_password(password, salt):
     )
 
 
+def derive_key(password, kdf_salt):
+    # DERIVE A Fernet ENCRYPTION KEY FROM THE MASTER PASSWORD + kdf_salt.
+    # RETURNS URL-SAFE BASE64-ENCODED 32-BYTE KEY (WHAT Fernet EXPECTS).
+    #
+    # WHY A SEPARATE SALT FROM auth_salt:
+    #   AUTHENTICATION HASH AND ENCRYPTION KEY MUST NOT BE INTERCHANGEABLE.
+    #   USING kdf_salt HERE MEANS KNOWING (OR CRACKING) THE STORED auth_hash
+    #   DOES NOT DIRECTLY GIVE YOU THE VAULT KEY.
+    #
+    # WHY THE KEY IS NEVER SAVED:
+    #   ANYONE WITH THE KEY CAN DECRYPT THE VAULT. WE REMAKE IT FROM THE
+    #   MASTER PASSWORD ONLY AFTER A SUCCESSFUL LOGIN, AND KEEP IT IN MEMORY.
+    key_bytes = hashlib.pbkdf2_hmac(
+        HASH_ALGORITHM,
+        password.encode("utf-8"),
+        kdf_salt,
+        PBKDF2_ITERATIONS,
+        dklen=KEY_SIZE,
+    )
+    # Fernet REQUIRES THE KEY AS URL-SAFE BASE64 OF EXACTLY 32 RAW BYTES.
+    return base64.urlsafe_b64encode(key_bytes)
+
+
 # ---------------------------------------------------------------------------
-# Config I/O (auth material only in Stage 1)
+# CONFIG I/O
 # ---------------------------------------------------------------------------
 
 def save_config(auth_salt, auth_hash, kdf_salt):
-    """
-    Write salts and auth hash to config.json as hex strings.
-
-    WHY hex: binary salts/hashes are not JSON-friendly as raw bytes;
-    hex is readable and easy to round-trip with bytes.fromhex().
-
-    WHY we save kdf_salt now even though Stage 1 does not encrypt yet:
-      The design says two separate salts. Creating kdf_salt at register time
-      means Stage 2 can derive the Fernet key without re-registering.
-      We never save the derived key itself — only the salt needed to remake it.
-    """
+    # WRITE SALTS AND AUTH HASH TO config.json AS HEX STRINGS.
+    #
+    # WHY HEX: BINARY SALTS/HASHES ARE NOT JSON-FRIENDLY AS RAW BYTES;
+    # HEX IS READABLE AND EASY TO ROUND-TRIP WITH bytes.fromhex().
+    #
+    # WHY WE SAVE kdf_salt BUT NEVER THE DERIVED KEY:
+    #   THE SALT LETS US REMAKE THE KEY AFTER LOGIN. SAVING THE KEY ITSELF
+    #   WOULD DEFEAT ENCRYPTION — ANYONE READING THE DISK COULD DECRYPT.
     data = {
         "auth_salt": auth_salt.hex(),
         "auth_hash": auth_hash.hex(),
@@ -107,11 +126,8 @@ def save_config(auth_salt, auth_hash, kdf_salt):
 
 
 def load_config():
-    """
-    Load config.json and return (auth_salt, auth_hash, kdf_salt) as bytes.
-
-    Returns None if the file is missing (first-run case).
-    """
+    # LOAD config.json AND RETURN (auth_salt, auth_hash, kdf_salt) AS BYTES.
+    # RETURNS None IF THE FILE IS MISSING (FIRST-RUN CASE).
     if not os.path.exists(CONFIG_FILE):
         return None
 
@@ -126,106 +142,158 @@ def load_config():
 
 
 # ---------------------------------------------------------------------------
-# Register / Login
+# VAULT I/O (ENCRYPTED BLOB) -> data.enc
+# ---------------------------------------------------------------------------
+# WHAT data.enc IS DOING AT STAGE 2:
+#   IT HOLDS THE ENTIRE PASSWORD VAULT AS ONE Fernet CIPHERTEXT FILE.
+#   RIGHT NOW THE VAULT IS AN EMPTY JSON OBJECT {} THAT WAS ENCRYPTED DURING
+#   register(). THERE ARE NO SITE ENTRIES YET (THAT COMES IN STAGE 3).
+#   ON LOGIN WE derive_key() THEN load_vault() TO DECRYPT IT BACK INTO A DICT.
+#   OPENING data.enc IN A TEXT EDITOR SHOULD LOOK LIKE GIBBERISH — THAT IS
+#   THE POINT. PLAINTEXT NEVER SITS ON DISK.
+
+def save_vault(vault, key):
+    # ENCRYPT THE WHOLE VAULT DICT AS ONE JSON BLOB AND WRITE data.enc.
+    #
+    # WHY ENCRYPT THE WHOLE VAULT AS ONE BLOB:
+    #   ONE Fernet TOKEN FOR EVERYTHING IS SIMPLE AND TAMPER-EVIDENT.
+    #   Fernet ALSO AUTHENTICATES CIPHERTEXT (DETECTS MODIFICATION).
+    #
+    # WHY ENCRYPT SITE PASSWORDS (NOT HASH THEM):
+    #   HASHES ARE ONE-WAY — WE COULD NEVER SHOW THE USER THEIR SAVED PASSWORD.
+    #   ENCRYPTION IS REVERSIBLE WITH THE KEY, SO ENTRIES STAY RETRIEVABLE.
+    fernet = Fernet(key)
+    # json.dumps TURNS THE DICT INTO TEXT; ENCODE TO BYTES FOR Fernet.
+    plaintext = json.dumps(vault).encode("utf-8")
+    token = fernet.encrypt(plaintext)
+    with open(DATA_FILE, "wb") as f:
+        f.write(token)
+
+
+def load_vault(key):
+    # DECRYPT data.enc AND RETURN THE VAULT AS A PYTHON DICT.
+    # IF data.enc IS MISSING, RETURN AN EMPTY VAULT DICT (AND CREATE THE FILE).
+    # FULL InvalidToken / CORRUPTION HANDLING IS EXPANDED IN STAGE 4.
+    if not os.path.exists(DATA_FILE):
+        vault = {}
+        save_vault(vault, key)
+        return vault
+
+    with open(DATA_FILE, "rb") as f:
+        token = f.read()
+
+    fernet = Fernet(key)
+    plaintext = fernet.decrypt(token)
+    return json.loads(plaintext.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# REGISTER / LOGIN
 # ---------------------------------------------------------------------------
 
 def register():
-    """
-    First-run setup: ask for a master password twice, create salts + auth hash.
-
-    WHY confirm twice: typos on a master password would lock the user out
-    forever once we encrypt the vault (Stage 2+), because we cannot recover it.
-    """
-    print("=== First-time setup ===")
-    print("Create a master password (at least 8 characters).")
-    print("This password unlocks your vault. It is never stored in plain text.")
+    # FIRST-RUN SETUP: MASTER PASSWORD, SALTS, AUTH HASH, EMPTY ENCRYPTED VAULT.
+    #
+    # WHY CONFIRM TWICE: TYPOS ON A MASTER PASSWORD WOULD LOCK THE USER OUT
+    # FOREVER, BECAUSE WE CANNOT RECOVER AN ENCRYPTED VAULT WITHOUT THE PASSWORD.
+    print("First time setup")
+    print("Pick a master password (at least 8 characters).")
+    print("You'll need this every time you open the vault.")
 
     while True:
-        # WHY getpass: the password is not echoed to the screen (shoulder-surfing).
+        # WHY getpass: THE PASSWORD IS NOT ECHOED TO THE SCREEN (SHOULDER-SURFING).
         password = getpass.getpass("Master password: ")
-        confirm = getpass.getpass("Confirm master password: ")
+        confirm = getpass.getpass("Confirm it: ")
 
         if password != confirm:
-            print("Passwords do not match. Try again.")
+            print("Those didn't match, try again.")
             continue
 
         if len(password) < 8:
-            print("Password must be at least 8 characters. Try again.")
+            print("Too short — needs to be at least 8 characters.")
             continue
 
         break
 
-    # Two DIFFERENT salts for two DIFFERENT jobs (auth vs encryption key).
+    # TWO DIFFERENT SALTS FOR TWO DIFFERENT JOBS (AUTH VS ENCRYPTION KEY).
     auth_salt = generate_salt()
     kdf_salt = generate_salt()
 
-    # Only the auth path is used in Stage 1. kdf_salt is saved for Stage 2.
     auth_hash = hash_password(password, auth_salt)
-
     save_config(auth_salt, auth_hash, kdf_salt)
-    print("Master password registered. Config saved to", CONFIG_FILE)
-    # Do not keep the password longer than needed; local var ends with function.
+
+    # CREATE AN EMPTY ENCRYPTED VAULT NOW (STAGE 2).
+    # KEY EXISTS ONLY IN MEMORY HERE — WE DO NOT WRITE IT ANYWHERE.
+    key = derive_key(password, kdf_salt)
+    save_vault({}, key)
+
+    print("Done. Saved config.json and an empty data.enc.")
     return True
 
 
 def login():
-    """
-    Ask for the master password (up to 3 tries) and verify against auth_hash.
-
-    Returns True on success, False on failure.
-
-    WHY verify BEFORE any key derivation / vault decrypt (Stage 2+):
-      Wrong password should fail early. We do not derive the encryption key
-      or open data.enc until authentication succeeds.
-    """
+    # ASK FOR THE MASTER PASSWORD (UP TO 3 TRIES) AND VERIFY AGAINST auth_hash.
+    # ON SUCCESS: RETURN THE MASTER PASSWORD STRING (NEEDED TO DERIVE THE KEY).
+    # ON FAILURE: RETURN None.
+    #
+    # WHY RETURN THE PASSWORD ONLY AFTER A MATCHING HASH:
+    #   CALLERS MUST NOT DERIVE THE KEY OR OPEN data.enc ON A WRONG PASSWORD.
+    #   WE STOP BEFORE KEY DERIVATION WHEN VERIFICATION FAILS.
     config = load_config()
     if config is None:
-        print("No config found. Run registration first.")
-        return False
+        print("No config.json found — run setup first.")
+        return None
 
     auth_salt, auth_hash, _kdf_salt = config
 
-    print("=== Login ===")
+    print("Login")
     for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
         password = getpass.getpass(
             f"Master password (attempt {attempt}/{MAX_LOGIN_ATTEMPTS}): "
         )
 
-        # Re-hash the attempt with the SAME auth_salt used at registration.
         attempt_hash = hash_password(password, auth_salt)
 
-        # WHY hmac.compare_digest, never == :
-        #   == can short-circuit and leak timing info about how many bytes
-        #   matched. compare_digest is constant-time for equal-length digests.
+        # WHY hmac.compare_digest, NEVER == :
+        #   == CAN SHORT-CIRCUIT AND LEAK TIMING INFO ABOUT HOW MANY BYTES
+        #   MATCHED. compare_digest IS CONSTANT-TIME FOR EQUAL-LENGTH DIGESTS.
         if hmac.compare_digest(attempt_hash, auth_hash):
-            print("Login successful.")
-            return True
+            print("You're in.")
+            return password
 
-        print("Incorrect password.")
+        print("Wrong password.")
 
-    print("Too many failed attempts. Exiting.")
-    return False
+    print("Too many tries. Exiting.")
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Entry point (Stage 1: auth only)
+# ENTRY POINT (STAGE 2: AUTH + VAULT OPEN/CLOSE DEMO)
 # ---------------------------------------------------------------------------
 
 def main():
-    """
-    Stage 1 flow:
-      - No config.json  -> register()
-      - Has config.json -> login()
-    Vault encryption and the menu come in later stages.
-    """
+    # STAGE 2 FLOW:
+    #   - NO config.json -> register() (ALSO CREATES EMPTY data.enc)
+    #   - ELSE          -> login()
+    #   - ONLY AFTER LOGIN SUCCEEDS: derive_key() THEN load_vault()
+    #
+    # MENU (ADD/VIEW/LIST/DELETE) COMES IN STAGE 3.
     if not os.path.exists(CONFIG_FILE):
         register()
-        # After first register, also log in once so the user sees the path.
-        # (Optional for Stage 1; keeps the demo clear.)
         print()
-        login()
-    else:
-        login()
+
+    password = login()
+    if password is None:
+        return
+
+    # AUTH PASSED — NOW IT IS SAFE TO DERIVE THE KEY AND TOUCH THE VAULT.
+    config = load_config()
+    _auth_salt, _auth_hash, kdf_salt = config
+    key = derive_key(password, kdf_salt)
+    vault = load_vault(key)
+
+    # STAGE 2 SMOKE-CHECK: SHOW COUNT ONLY — NEVER PRINT SECRETS OR THE KEY.
+    print(f"Vault unlocked ({len(vault)} entries).")
 
 
 if __name__ == "__main__":
